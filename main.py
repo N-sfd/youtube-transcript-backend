@@ -5,6 +5,9 @@ from pydantic import BaseModel
 
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api.formatters import TextFormatter
+from transformers import pipeline
+summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+
 from youtube_transcript_api._errors import (
     TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, IpBlocked, RequestBlocked
 )
@@ -64,3 +67,4 @@ def summarize_get(url: str, max_retries: int = 3, retry_delay: int = 2):
         return {"video_id": video_id, "transcript": transcript}
     except Exception as e:
         return {"error": str(e)}
+
