@@ -6,18 +6,10 @@ from pydantic import BaseModel
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api.formatters import TextFormatter
 from youtube_transcript_api._errors import (
-    TranscriptsDisabled,
-    NoTranscriptFound,
-    VideoUnavailable,
-    IpBlocked,
-    RequestBlocked
+    TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, IpBlocked, RequestBlocked
 )
 
-app = FastAPI(
-    title="YouTube Transcript API",
-    description="API to fetch and summarize YouTube video transcripts",
-    version="1.0.0"
-)
+app = FastAPI(title="YouTube Transcript API", version="1.0.0")
 
 class Req(BaseModel):
     url: str
@@ -35,11 +27,8 @@ def fetch_transcript(video_id: str, max_retries: int, retry_delay: int) -> str:
     for attempt in range(max_retries):
         try:
             api = YouTubeTranscriptApi()
-            fetched = api.fetch(video_id, languages=['en'])
-            # Convert FetchedTranscript to list format for TextFormatter
-            transcript_data = list(fetched)
-            return TextFormatter().format_transcript(transcript_data)
-
+            fetched = api.fetch(video_id)
+            return TextFormatter().format_transcript(fetched)
         except (IpBlocked, RequestBlocked):
             if attempt < max_retries - 1:
                 time.sleep(retry_delay * (attempt + 1))
@@ -54,26 +43,12 @@ def fetch_transcript(video_id: str, max_retries: int, retry_delay: int) -> str:
         except Exception as e:
             raise RuntimeError(str(e))
 
-@app.get("/")
-def root():
-    return {
-        "message": "YouTube Transcript API",
-        "version": "1.0.0",
-        "endpoints": {
-            "POST /summarize": "Fetch transcript (requires JSON body with 'url')",
-            "GET /summarize": "Fetch transcript (requires 'url' query parameter)",
-            "GET /docs": "API documentation",
-            "GET /health": "Health check"
-        }
-    }
-
 @app.get("/health")
 def health():
-    return {"status": "healthy", "service": "YouTube Transcript API"}
+    return {"status": "healthy"}
 
 @app.post("/summarize")
 def summarize_post(req: Req):
-    """Fetch transcript using POST request with JSON body."""
     try:
         video_id = extract_video_id(req.url)
         transcript = fetch_transcript(video_id, req.max_retries, req.retry_delay)
@@ -83,7 +58,6 @@ def summarize_post(req: Req):
 
 @app.get("/summarize")
 def summarize_get(url: str, max_retries: int = 3, retry_delay: int = 2):
-    """Fetch transcript using GET request with query parameters."""
     try:
         video_id = extract_video_id(url)
         transcript = fetch_transcript(video_id, max_retries, retry_delay)
