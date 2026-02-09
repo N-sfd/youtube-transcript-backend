@@ -47,7 +47,6 @@ def extract_video_id(url: str) -> str:
 def fetch_transcript(video_id: str, max_retries: int, retry_delay: int) -> str:
     for attempt in range(max_retries):
         try:
-            # Try list_transcripts approach (more reliable)
             tl = YouTubeTranscriptApi.list_transcripts(video_id)
 
             try:
@@ -75,10 +74,7 @@ def fetch_transcript(video_id: str, max_retries: int, retry_delay: int) -> str:
 
 
 def hf_summarize(text: str) -> str:
-    """
-    Uses Hugging Face Inference API.
-    Returns a string summary OR a readable error string.
-    """
+    """Uses Hugging Face Inference API."""
     if not HF_TOKEN:
         return "(HF_TOKEN not set in Railway Variables)"
 
@@ -99,21 +95,17 @@ def hf_summarize(text: str) -> str:
 
     r = requests.post(url, headers=headers, json=payload, timeout=180)
 
-    # HF sometimes returns NON-JSON on errors
     try:
         data = r.json()
     except Exception:
         return f"(HF returned non-JSON. Status={r.status_code}. Body={r.text[:200]})"
 
-    # Model loading case
     if isinstance(data, dict) and "estimated_time" in data:
         return "(HF model is loading. Try again in ~20 seconds.)"
 
-    # Standard HF error case
     if isinstance(data, dict) and data.get("error"):
         return f"(HF error: {data['error']})"
 
-    # Normal response
     if isinstance(data, list) and len(data) > 0:
         return data[0].get("summary_text", "(HF: summary_text missing)")
 
