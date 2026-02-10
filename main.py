@@ -15,19 +15,18 @@ from youtube_transcript_api._errors import (
     RequestBlocked,
 )
 
-# -------------------------
-# ENV (set in Railway Variables)
-# -------------------------
+# -----------------------------
+# ENV
+# -----------------------------
 ENABLE_SUMMARY = os.getenv("ENABLE_SUMMARY", "1") == "1"
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 HF_SUMMARY_MODEL = os.getenv("HF_SUMMARY_MODEL", "facebook/bart-large-cnn").strip()
-
 HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_SUMMARY_MODEL}"
 
 app = FastAPI(
     title="YouTube Transcript API",
     version="1.0.0",
-    description="Fetch YouTube transcript and optionally generate a summary via Hugging Face Inference API",
+    description="Fetch YouTube transcript and optionally generate summary via Hugging Face Inference API",
 )
 
 class Req(BaseModel):
@@ -39,75 +38,79 @@ class Req(BaseModel):
 
 def extract_video_id(url: str) -> str:
     url = (url or "").strip()
-    if not url:
-        raise ValueError("URL is empty")
-
-    # Works for:
-    # watch?v=ID&list=..., youtu.be/ID, shorts/ID, embed/ID
+    # supports watch?v=ID&list=..., youtu.be/ID, shorts/ID, embed/ID
     m = re.search(r"(?:v=|youtu\.be/|shorts/|embed/|/v/)([0-9A-Za-z_-]{11})", url)
     if not m:
-        raise ValueError("Could not extract video ID from URL")
+        raise ValueError("Invalid YouTube URL (could not find a video id).")
     return m.group(1)
 
 
 def fetch_transcript_text(video_id: str, max_retries: int, retry_delay: int) -> str:
-    api = YouTubeTranscriptApi()
-
+    """
+    Works with youtube-transcript-api==1.2.2 using: YouTubeTranscriptApi().fetch(video_id, languages=['en'])
+    """
     for attempt in range(max_retries):
         try:
-            fetched = api.fetch(video_id, languages=["en"])
-            transcript_data = list(fetched)  # IMPORTANT for TextFormatter
-            return TextFormatter().format_transcript(transcript_data)
+            api = YouTubeTranscriptApi()
+            fetched = api.fetch(video_id, languages=["en"])  # FetchedTranscript iterable
+
+            # Convert to list[dict] for TextFormatter
+            transcript_items = []
+            for item in fetched:
+                transcript_items.append({
+                    "text": item.text,
+                    "start": float(getattr(item, "start", 0.0)),
+                    "duration": float(getattr(item, "duration", 0.0)),
+                })
+
+            return TextFormatter().format_transcript(transcript_items)
 
         except (IpBlocked, RequestBlocked):
             if attempt < max_retries - 1:
                 time.sleep(retry_delay * (attempt + 1))
                 continue
             raise ConnectionError("Blocked by YouTube (IP/Request blocked). Try later.")
-
         except TranscriptsDisabled:
             raise ValueError("Transcripts are disabled for this video.")
         except NoTranscriptFound:
-            raise ValueError("No transcript found for this video.")
+            raise ValueError("No transcript found for this video (not available in requested language).")
         except VideoUnavailable:
             raise ValueError("Video unavailable.")
         except Exception as e:
             raise RuntimeError(str(e))
 
 
-def hf_summarize(text: str) -> str:
+def summarize_with_hf(text: str) -> str:
     if not ENABLE_SUMMARY:
         return ""
 
     if not HF_TOKEN:
-        return ""  # summary disabled if no token
+        return ""  # silently return no summary if no token
 
     text = (text or "").strip()
     if not text:
         return ""
 
-    # Keep payload reasonable
+    # Keep input smaller to avoid inference limits/timeouts
     text = text[:6000]
 
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    payload = {
-        "inputs": text,
-        "parameters": {"max_length": 170, "min_length": 60, "do_sample": False},
-    }
+    payload = {"inputs": text, "parameters": {"max_length": 160, "min_length": 60, "do_sample": False}}
 
     r = requests.post(HF_API_URL, headers=headers, json=payload, timeout=180)
 
-    # HF sometimes returns dict with error
-    try:
-        data = r.json()
-    except Exception:
+    # HF sometimes returns 503 while loading model
+    if r.status_code == 503:
         return ""
 
-    if isinstance(data, dict) and data.get("error"):
-        return ""
+    r.raise_for_status()
+    data = r.json()
 
-    if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
-        return data[0].get("summary_text", "") or ""
+    # Typical response: [{"summary_text": "..."}]
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return data[0].get("summary_text", "") or data[0].get("generated_text", "") or ""
+    if isinstance(data, dict):
+        return data.get("summary_text", "") or data.get("generated_text", "") or ""
 
     return ""
 
@@ -132,20 +135,12 @@ def health():
 
 
 @app.post("/summarize")
-def summarize(req: Req):
+def summarize_post(req: Req):
     try:
-        video_id = extract_video_id(req.url)
-        transcript = fetch_transcript_text(video_id, req.max_retries, req.retry_delay)
-
-        summary = ""
-        if req.summarize:
-            summary = hf_summarize(transcript)
-
-        return {
-            "video_id": video_id,
-            "transcript": transcript,
-            "summary": summary,
-        }
-
+        vid = extract_video_id(req.url)
+        transcript = fetch_transcript_text(vid, req.max_retries, req.retry_delay)
+        summary = summarize_with_hf(transcript) if req.summarize else ""
+        return {"video_id": vid, "transcript": transcript, "summary": summary, "error": ""}
     except Exception as e:
-        return {"error": str(e)}
+        # always return JSON
+        return {"video_id": "", "transcript": "", "summary": "", "error": str(e)}
