@@ -47,21 +47,31 @@ def extract_video_id(url: str) -> str:
 
 def fetch_transcript_text(video_id: str, max_retries: int, retry_delay: int) -> str:
     """
-    Works with youtube-transcript-api==1.2.2 using: YouTubeTranscriptApi().fetch(video_id, languages=['en'])
+    Works across youtube-transcript-api variants:
+    - Sometimes returns dicts: {"text","start","duration"}
+    - Sometimes returns objects: item.text, item.start, item.duration
     """
     for attempt in range(max_retries):
         try:
             api = YouTubeTranscriptApi()
-            fetched = api.fetch(video_id, languages=["en"])  # FetchedTranscript iterable
+            fetched = api.fetch(video_id, languages=["en"])  # iterable
 
-            # Convert to list[dict] for TextFormatter
             transcript_items = []
             for item in fetched:
-                transcript_items.append({
-                    "text": item.text,
-                    "start": float(getattr(item, "start", 0.0)),
-                    "duration": float(getattr(item, "duration", 0.0)),
-                })
+                # ✅ If item is already a dict
+                if isinstance(item, dict):
+                    transcript_items.append({
+                        "text": item.get("text", ""),
+                        "start": float(item.get("start", 0.0) or 0.0),
+                        "duration": float(item.get("duration", 0.0) or 0.0),
+                    })
+                else:
+                    # ✅ If item is an object with attributes
+                    transcript_items.append({
+                        "text": getattr(item, "text", ""),
+                        "start": float(getattr(item, "start", 0.0) or 0.0),
+                        "duration": float(getattr(item, "duration", 0.0) or 0.0),
+                    })
 
             return TextFormatter().format_transcript(transcript_items)
 
@@ -78,6 +88,7 @@ def fetch_transcript_text(video_id: str, max_retries: int, retry_delay: int) -> 
             raise ValueError("Video unavailable.")
         except Exception as e:
             raise RuntimeError(str(e))
+
 
 
 def summarize_with_hf(text: str) -> str:
@@ -144,3 +155,4 @@ def summarize_post(req: Req):
     except Exception as e:
         # always return JSON
         return {"video_id": "", "transcript": "", "summary": "", "error": str(e)}
+
