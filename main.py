@@ -2,11 +2,12 @@ import os
 import re
 import time
 import requests
+from typing import Any, Dict, List, Optional
+
 from fastapi import FastAPI
 from pydantic import BaseModel
 
 from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api.formatters import TextFormatter
 from youtube_transcript_api._errors import (
     TranscriptsDisabled,
     NoTranscriptFound,
@@ -16,7 +17,7 @@ from youtube_transcript_api._errors import (
 )
 
 # -----------------------------
-# ENV
+# ENV (Railway Variables)
 # -----------------------------
 ENABLE_SUMMARY = os.getenv("ENABLE_SUMMARY", "1") == "1"
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
@@ -38,90 +39,121 @@ class Req(BaseModel):
 
 def extract_video_id(url: str) -> str:
     url = (url or "").strip()
-    # supports watch?v=ID&list=..., youtu.be/ID, shorts/ID, embed/ID
     m = re.search(r"(?:v=|youtu\.be/|shorts/|embed/|/v/)([0-9A-Za-z_-]{11})", url)
     if not m:
-        raise ValueError("Invalid YouTube URL (could not find a video id).")
+        raise ValueError("Invalid YouTube URL (could not find video id).")
     return m.group(1)
+
+
+def _normalize_items(items: List[Any]) -> List[Dict[str, Any]]:
+    """
+    Ensure each transcript item is a dict with keys: text/start/duration.
+    Works whether the library returns dicts or objects.
+    """
+    normalized: List[Dict[str, Any]] = []
+    for it in items:
+        if isinstance(it, dict):
+            normalized.append(
+                {
+                    "text": it.get("text", "") or "",
+                    "start": float(it.get("start", 0.0) or 0.0),
+                    "duration": float(it.get("duration", 0.0) or 0.0),
+                }
+            )
+        else:
+            normalized.append(
+                {
+                    "text": getattr(it, "text", "") or "",
+                    "start": float(getattr(it, "start", 0.0) or 0.0),
+                    "duration": float(getattr(it, "duration", 0.0) or 0.0),
+                }
+            )
+    return normalized
 
 
 def fetch_transcript_text(video_id: str, max_retries: int, retry_delay: int) -> str:
     """
-    Works across youtube-transcript-api variants:
-    - Sometimes returns dicts: {"text","start","duration"}
-    - Sometimes returns objects: item.text, item.start, item.duration
+    Most stable approach:
+    - Try class method get_transcript (common)
+    - If not available, try fetch() API (newer)
+    - Build plain text by joining 'text' fields (NO TextFormatter).
     """
+    last_err: Optional[Exception] = None
+
     for attempt in range(max_retries):
         try:
-            api = YouTubeTranscriptApi()
-            fetched = api.fetch(video_id, languages=["en"])  # iterable
+            # 1) Prefer get_transcript if it exists in installed version
+            try:
+                items = YouTubeTranscriptApi.get_transcript(video_id, languages=["en"])
+            except AttributeError:
+                # 2) Fallback: fetch() API (some versions expose this)
+                api = YouTubeTranscriptApi()
+                fetched = api.fetch(video_id, languages=["en"])
+                items = list(fetched)
 
-            transcript_items = []
-            for item in fetched:
-                # ✅ If item is already a dict
-                if isinstance(item, dict):
-                    transcript_items.append({
-                        "text": item.get("text", ""),
-                        "start": float(item.get("start", 0.0) or 0.0),
-                        "duration": float(item.get("duration", 0.0) or 0.0),
-                    })
-                else:
-                    # ✅ If item is an object with attributes
-                    transcript_items.append({
-                        "text": getattr(item, "text", ""),
-                        "start": float(getattr(item, "start", 0.0) or 0.0),
-                        "duration": float(getattr(item, "duration", 0.0) or 0.0),
-                    })
+            normalized = _normalize_items(items)
 
-            return TextFormatter().format_transcript(transcript_items)
+            # Join lines safely (this avoids ALL ".text" issues)
+            lines = [x["text"].replace("\n", " ").strip() for x in normalized if x.get("text")]
+            transcript_text = "\n".join(lines).strip()
 
-        except (IpBlocked, RequestBlocked):
+            if not transcript_text:
+                raise ValueError("Transcript returned empty text.")
+            return transcript_text
+
+        except (IpBlocked, RequestBlocked) as e:
+            last_err = e
             if attempt < max_retries - 1:
                 time.sleep(retry_delay * (attempt + 1))
                 continue
             raise ConnectionError("Blocked by YouTube (IP/Request blocked). Try later.")
-        except TranscriptsDisabled:
-            raise ValueError("Transcripts are disabled for this video.")
-        except NoTranscriptFound:
-            raise ValueError("No transcript found for this video (not available in requested language).")
-        except VideoUnavailable:
-            raise ValueError("Video unavailable.")
+        except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable) as e:
+            raise ValueError(str(e))
         except Exception as e:
-            raise RuntimeError(str(e))
-
+            last_err = e
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay * (attempt + 1))
+                continue
+            raise RuntimeError(str(last_err))
 
 
 def summarize_with_hf(text: str) -> str:
+    """
+    Uses HF Inference API. Requires HF_TOKEN set in Railway Variables.
+    Returns "" if summary disabled or token missing.
+    """
     if not ENABLE_SUMMARY:
         return ""
-
     if not HF_TOKEN:
-        return ""  # silently return no summary if no token
+        return ""
 
     text = (text or "").strip()
     if not text:
         return ""
 
-    # Keep input smaller to avoid inference limits/timeouts
+    # Limit to avoid model limits/timeouts
     text = text[:6000]
 
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    payload = {"inputs": text, "parameters": {"max_length": 160, "min_length": 60, "do_sample": False}}
+    payload = {
+        "inputs": text,
+        "parameters": {"max_length": 180, "min_length": 60, "do_sample": False},
+    }
 
-    r = requests.post(HF_API_URL, headers=headers, json=payload, timeout=180)
+    # retry if model is loading (503)
+    for _ in range(3):
+        r = requests.post(HF_API_URL, headers=headers, json=payload, timeout=180)
+        if r.status_code == 503:
+            time.sleep(2)
+            continue
+        r.raise_for_status()
+        data = r.json()
 
-    # HF sometimes returns 503 while loading model
-    if r.status_code == 503:
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            return data[0].get("summary_text", "") or data[0].get("generated_text", "") or ""
+        if isinstance(data, dict):
+            return data.get("summary_text", "") or data.get("generated_text", "") or ""
         return ""
-
-    r.raise_for_status()
-    data = r.json()
-
-    # Typical response: [{"summary_text": "..."}]
-    if isinstance(data, list) and data and isinstance(data[0], dict):
-        return data[0].get("summary_text", "") or data[0].get("generated_text", "") or ""
-    if isinstance(data, dict):
-        return data.get("summary_text", "") or data.get("generated_text", "") or ""
 
     return ""
 
@@ -153,6 +185,4 @@ def summarize_post(req: Req):
         summary = summarize_with_hf(transcript) if req.summarize else ""
         return {"video_id": vid, "transcript": transcript, "summary": summary, "error": ""}
     except Exception as e:
-        # always return JSON
         return {"video_id": "", "transcript": "", "summary": "", "error": str(e)}
-
