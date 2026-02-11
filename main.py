@@ -22,7 +22,8 @@ from youtube_transcript_api._errors import (
 ENABLE_SUMMARY = os.getenv("ENABLE_SUMMARY", "1") == "1"
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 HF_SUMMARY_MODEL = os.getenv("HF_SUMMARY_MODEL", "facebook/bart-large-cnn").strip()
-HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_SUMMARY_MODEL}"
+HF_API_URL = f"https://router.huggingface.co/hf-inference/models/{HF_SUMMARY_MODEL}"
+
 
 app = FastAPI(
     title="YouTube Transcript API",
@@ -118,12 +119,9 @@ def fetch_transcript_text(video_id: str, max_retries: int, retry_delay: int) -> 
 
 
 def summarize_with_hf(text: str) -> str:
-    """
-    Uses HF Inference API. Requires HF_TOKEN set in Railway Variables.
-    Returns "" if summary disabled or token missing.
-    """
     if not ENABLE_SUMMARY:
         return ""
+
     if not HF_TOKEN:
         return ""
 
@@ -131,31 +129,38 @@ def summarize_with_hf(text: str) -> str:
     if not text:
         return ""
 
-    # Limit to avoid model limits/timeouts
     text = text[:6000]
 
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    payload = {
-        "inputs": text,
-        "parameters": {"max_length": 180, "min_length": 60, "do_sample": False},
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json"
     }
 
-    # retry if model is loading (503)
-    for _ in range(3):
+    payload = {
+    "inputs": text,
+    "parameters": {
+        "max_length": 180,
+        "min_length": 60,
+        "do_sample": False
+    }
+}
+
+
+    try:
         r = requests.post(HF_API_URL, headers=headers, json=payload, timeout=180)
-        if r.status_code == 503:
-            time.sleep(2)
-            continue
         r.raise_for_status()
         data = r.json()
 
-        if isinstance(data, list) and data and isinstance(data[0], dict):
-            return data[0].get("summary_text", "") or data[0].get("generated_text", "") or ""
+        if isinstance(data, list) and data:
+            return data[0].get("summary_text") or data[0].get("generated_text", "")
         if isinstance(data, dict):
-            return data.get("summary_text", "") or data.get("generated_text", "") or ""
+            return data.get("summary_text") or data.get("generated_text", "")
+
         return ""
 
-    return ""
+    except Exception as e:
+        return f"HF Inference error: {str(e)}"
+
 
 
 @app.get("/")
@@ -186,3 +191,10 @@ def summarize_post(req: Req):
         return {"video_id": vid, "transcript": transcript, "summary": summary, "error": ""}
     except Exception as e:
         return {"video_id": "", "transcript": "", "summary": "", "error": str(e)}
+
+@app.get("/summarize")
+def summarize_get(url: str, max_retries: int = 3, retry_delay: int = 2, summarize: bool = True):
+    req = Req(url=url, max_retries=max_retries, retry_delay=retry_delay, summarize=summarize)
+    return summarize_post(req)
+
+
